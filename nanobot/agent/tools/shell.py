@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,7 @@ class ExecTool(Tool):
         restrict_to_workspace: bool = False,
         sandbox: str = "",
         path_append: str = "",
+        allowed_env_keys: list[str] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -60,10 +62,19 @@ class ExecTool(Tool):
             r">\s*/dev/sd",                  # write to disk
             r"\b(shutdown|reboot|poweroff)\b",  # system power
             r":\(\)\s*\{.*\};\s*:",          # fork bomb
+            # Block writes to nanobot internal state files (#2989).
+            # history.jsonl / .dream_cursor are managed by append_history();
+            # direct writes corrupt the cursor format and crash /dream.
+            r">>?\s*\S*(?:history\.jsonl|\.dream_cursor)",            # > / >> redirect
+            r"\btee\b[^|;&<>]*(?:history\.jsonl|\.dream_cursor)",     # tee / tee -a
+            r"\b(?:cp|mv)\b(?:\s+[^\s|;&<>]+)+\s+\S*(?:history\.jsonl|\.dream_cursor)",  # cp/mv target
+            r"\bdd\b[^|;&<>]*\bof=\S*(?:history\.jsonl|\.dream_cursor)",  # dd of=
+            r"\bsed\s+-i[^|;&<>]*(?:history\.jsonl|\.dream_cursor)",  # sed -i
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
+        self.allowed_env_keys = allowed_env_keys or []
 
     @property
     def name(self) -> str:
@@ -91,6 +102,21 @@ class ExecTool(Tool):
         timeout: int | None = None, **kwargs: Any,
     ) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
+
+        # Prevent an LLM-supplied working_dir from escaping the configured
+        # workspace when restrict_to_workspace is enabled (#2826). Without
+        # this, a caller can pass working_dir="/etc" and then all absolute
+        # paths under /etc would pass the _guard_command check that anchors
+        # on cwd.
+        if self.restrict_to_workspace and self.working_dir:
+            try:
+                requested = Path(cwd).expanduser().resolve()
+                workspace_root = Path(self.working_dir).expanduser().resolve()
+            except Exception:
+                return "Error: working_dir could not be resolved"
+            if requested != workspace_root and workspace_root not in requested.parents:
+                return "Error: working_dir is outside the configured workspace"
+
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
@@ -111,9 +137,10 @@ class ExecTool(Tool):
 
         if self.path_append:
             if _IS_WINDOWS:
-                env["PATH"] = env.get("PATH", "") + ";" + self.path_append
+                env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
             else:
-                command = f'export PATH="$PATH:{self.path_append}"; {command}'
+                env["NANOBOT_PATH_APPEND"] = self.path_append
+                command = f'export PATH="$PATH{os.pathsep}$NANOBOT_PATH_APPEND"; {command}'
 
         try:
             process = await self._spawn(command, cwd, env)
@@ -186,9 +213,8 @@ class ExecTool(Tool):
         """Kill a subprocess and reap it to prevent zombies."""
         process.kill()
         try:
-            await asyncio.wait_for(process.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            pass
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=5.0)
         finally:
             if not _IS_WINDOWS:
                 try:
@@ -208,7 +234,7 @@ class ExecTool(Tool):
         """
         if _IS_WINDOWS:
             sr = os.environ.get("SYSTEMROOT", r"C:\Windows")
-            return {
+            env = {
                 "SYSTEMROOT": sr,
                 "COMSPEC": os.environ.get("COMSPEC", f"{sr}\\system32\\cmd.exe"),
                 "USERPROFILE": os.environ.get("USERPROFILE", ""),
@@ -218,13 +244,29 @@ class ExecTool(Tool):
                 "TMP": os.environ.get("TMP", f"{sr}\\Temp"),
                 "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
                 "PATH": os.environ.get("PATH", f"{sr}\\system32;{sr}"),
+                "APPDATA": os.environ.get("APPDATA", ""),
+                "LOCALAPPDATA": os.environ.get("LOCALAPPDATA", ""),
+                "ProgramData": os.environ.get("ProgramData", ""),
+                "ProgramFiles": os.environ.get("ProgramFiles", ""),
+                "ProgramFiles(x86)": os.environ.get("ProgramFiles(x86)", ""),
+                "ProgramW6432": os.environ.get("ProgramW6432", ""),
             }
+            for key in self.allowed_env_keys:
+                val = os.environ.get(key)
+                if val is not None:
+                    env[key] = val
+            return env
         home = os.environ.get("HOME", "/tmp")
-        return {
+        env = {
             "HOME": home,
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "TERM": os.environ.get("TERM", "dumb"),
         }
+        for key in self.allowed_env_keys:
+            val = os.environ.get(key)
+            if val is not None:
+                env[key] = val
+        return env
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
@@ -257,8 +299,8 @@ class ExecTool(Tool):
                     continue
 
                 media_path = get_media_dir().resolve()
-                if (p.is_absolute() 
-                    and cwd_path not in p.parents 
+                if (p.is_absolute()
+                    and cwd_path not in p.parents
                     and p != cwd_path
                     and media_path not in p.parents
                     and p != media_path
